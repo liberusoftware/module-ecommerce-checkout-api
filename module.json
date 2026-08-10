@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schemas.liberu.dev/module/v1.json",
+  "name": "ecommerce-checkout-api",
+  "display_name": "Ecommerce Checkout API",
+  "description": "Optional HTTP presentation for the Checkout module. A shopper surface addressed by the session token, whose placement endpoint carries the domain's idempotency contract onto the wire as an Idempotency-Key header with a distinct status for replay, conflict and in-flight; and a staff read surface behind the domain's policy. Registers nothing until the host opts a group in.",
+  "version": "0.1.0",
+  "category": "adapter",
+  "provider": "Liberu\\Ecommerce\\Checkout\\Api\\CheckoutApiServiceProvider",
+  "requires": {
+    "php": "^8.5",
+    "laravel": "^13.0",
+    "packages": {
+      "liberusoftware/ecommerce-checkout": "^0.1"
+    }
+  },
+  "capabilities": [
+    "ecommerce.checkout.api"
+  ],
+  "default_enabled": false,
+  "features": [
+    "Checkout session creation from lines handed in",
+    "Session lookup by opaque token",
+    "Contact and address writes",
+    "Basket discount writes",
+    "Consent capture with IP and user agent",
+    "Provider-neutral tender writes",
+    "Idempotent placement over an Idempotency-Key header",
+    "Distinct statuses for replay, payload conflict and in-flight",
+    "Session abandonment",
+    "Staff read surface behind the domain policy",
+    "Per-group route opt-in",
+    "OpenAPI 3.1 specification fragment",
+    "Per-operation token scopes",
+    "Configurable rate limiting",
+    "Structured operation logging without credentials or evidence"
+  ]
+}

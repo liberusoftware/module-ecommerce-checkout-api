@@ -1,0 +1,1747 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Ecommerce Checkout API",
+    "version": "0.1.0",
+    "summary": "The boundary between a basket and a commitment, over the wire — with the domain's idempotency contract carried onto HTTP rather than reinvented on top of it.",
+    "description": "A fragment, not a whole document: this package presents one module and a host merges this into whatever else it serves.\n\n**Two audiences, two route groups, two credentials.** `shopper` is the checkout itself, addressed by an opaque session token and needing no actor — the token *is* the credential, and the domain publishes no lookup by id precisely so a URL can never be an enumeration of everybody's baskets. `staff` is the operator's read view, behind an actor and the domain's `CheckoutSessionPolicy`. Neither group has a parameter that turns it into the other, and the staff group has no write at all.\n\n**Idempotency is the point.** `POST /checkout/sessions/{token}/placement` requires an `Idempotency-Key`, replays a repeat under the same key with `200` and `Idempotency-Replayed: true` without dispatching a second event, answers `409` for a key spent on a different payload, and answers `423` while a key is claimed by a call that has not finished. Those are three different instructions to a client and they get three different statuses.\n\n**Money is always an object** — `{\"minor\": 1999, \"currency\": \"GBP\", \"exponent\": 2, \"decimal\": \"19.99\"}` — and `decimal` is a string.\n\n**Two things are captured and never returned.** The IP address and user agent recorded with a consent are evidence, held for one purpose; they appear in no response and no log line. And the session token and idempotency key are kept out of this API's log lines, because a credential in a log aggregator is a credential held by everybody with log access.\n\nWhich of these operations exist at all is the deployment's decision. Every operation carries `x-liberu-route-group`, and a group the host has not named in `checkout-api.groups` is not registered — its paths answer 404 rather than 403.\n\nVersioning is by path. `{version}` is a configuration value and route names carry the same segment, so a host serving two versions side by side publishes the config twice over rather than renaming anybody's routes.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "contact": {
+      "name": "Liberu Software",
+      "url": "https://liberusoftware.com"
+    }
+  },
+  "servers": [
+    {
+      "url": "/{prefix}/{version}",
+      "description": "Wherever the host mounted the groups. Both segments are configuration.",
+      "variables": {
+        "prefix": {
+          "default": "api",
+          "description": "`checkout-api.prefix`."
+        },
+        "version": {
+          "default": "v1",
+          "enum": [
+            "v1"
+          ],
+          "description": "`checkout-api.version`."
+        }
+      }
+    }
+  ],
+  "security": [
+    {
+      "checkoutToken": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "shopper",
+      "description": "Route group `shopper`: one shopper's own checkout, addressed by its token. Needs no actor — the token is the credential and it names exactly one session."
+    },
+    {
+      "name": "staff",
+      "description": "Route group `staff`: the operator's read view, behind the domain's `CheckoutSessionPolicy`. Read only, deliberately."
+    }
+  ],
+  "paths": {
+    "/checkout/sessions": {
+      "post": {
+        "operationId": "startCheckoutSession",
+        "summary": "Start a checkout session from lines handed in",
+        "description": "Freezes a basket into a session: the lines are copied, the totals are computed once and stored, and an opaque 48-character `token` comes back that is the only handle on this checkout from here on.\n\n**There is no cart parameter and no cart lookup.** The lines arrive in the body, and the mapping from whatever you call a basket is deliberately yours — what a line *is*, which tax rate applies, what shipping was quoted and what a coupon came to are decisions somebody else already made. This module freezes them so a price a shopper agreed to cannot move between the agreeing and the charging.\n\n**Tax is an input, never a lookup.** Per line, either `tax_rate_bp` (basis points, applied to the net after any discount) or `tax_minor` (an amount you computed). Handing in an amount is a one-way door: `PUT .../discount` then answers 422, because reallocating an amount would mean deriving a rate from it. If a coupon can be entered after tax is computed, supply rates.\n\n**`team_id`, `store_id` and `customer_id` are not accepted here.** They come from the host's own middleware or configuration. This operation is one an anonymous caller can reach, and an anonymous caller asserting a customer id is an anonymous caller filing an order against somebody else's account.\n\nNot idempotent, and it does not need to be: a duplicate session that is never placed costs a row and is closed by the host's abandonment sweep. The operation a retry must not duplicate is the placement, and that one carries `Idempotency-Key`.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.write"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The session, with its token, its frozen lines and its totals.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/checkout/sessions/{token}": {
+      "get": {
+        "operationId": "getCheckoutSession",
+        "summary": "Read a checkout session by its token",
+        "description": "Everything the session holds: status, contact, addresses, lines, tenders, consents and totals.\n\nAnswers for a session in **any** state, including one already placed or abandoned. That is deliberate and it is how a client that lost a response finds out what happened to its checkout.\n\nThere is no lookup by id, on purpose: an incrementing id in a URL is an enumeration of everybody's checkouts. The token is unguessable and is the credential — treat it as a bearer token, keep it out of referrers and logs, and note that this API keeps it out of its own log lines.\n\nA token that names nothing and a token that names somebody else's checkout both answer 404. A 403 would confirm that a guessed string is a real checkout.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "abandonCheckoutSession",
+        "summary": "Abandon a checkout session",
+        "description": "Closes a session that will not be placed, as `abandoned`, and emits `CheckoutAbandoned`.\n\n**Only ever `abandoned`, never `expired`.** The domain keeps the two apart because they answer different questions in a funnel report and only one is worth a recovery email — expiry is the merchant's own price snapshot running out, which is not a thing a caller may assert. There is no parameter for it here and no route to it.\n\nA session that is already closed answers 409. The session stays readable afterwards.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AbandonRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The abandoned session.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/checkout/sessions/{token}/contact": {
+      "put": {
+        "operationId": "setCheckoutContact",
+        "summary": "Set the email and the addresses",
+        "description": "Who the order is for and where it goes.\n\n**A null or absent field leaves the stored one alone.** That is what a multi-step checkout needs: the shipping step must not blank the email the contact step collected.\n\nAddresses are stored whole and no field inside them is validated. Address format is a per-country problem with a long tail — a county that is a province that is a prefecture, a postcode optional in Ireland and mandatory in Germany — and a package shipping its own opinion about it releases every time a country disagrees. What is guaranteed is that whatever you captured travels intact onto `CheckoutCompleted`.\n\n`customer_id` is not accepted here. It is the host's to resolve from its own authentication.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContactRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The session, with the contact details as they now stand.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/checkout/sessions/{token}/discount": {
+      "put": {
+        "operationId": "applyCheckoutDiscount",
+        "summary": "Set the basket-wide discount",
+        "description": "The amount arrives **already decided**. No coupon is validated here, no code is looked up and no eligibility rule is evaluated — those belong to whoever owns promotions.\n\nWhat this module owns is where the money lands: **pro-rata across every line, with untaxable lines in the denominator**, and tax reapplied to the new nets. A flat subtraction off one blended subtotal is only correct while every line shares a rate; leaving untaxable lines out concentrates the discount on what remains and under-taxes it.\n\n**422 when any line's tax arrived as an amount rather than a rate** (`TaxAmountNotReallocatable`). Scaling that amount would mean deriving a rate from it, which this module has promised not to do, and leaving it alone would leave a session whose tax belongs to a discount that no longer applies. This is a legitimate refusal of a well-formed request, not a fault — supply `tax_rate_bp` at `POST /checkout/sessions` if a coupon can be entered after tax is computed.\n\n422 also when the discount exceeds the subtotal.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscountRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The session, recomputed line by line.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/checkout/sessions/{token}/consents": {
+      "post": {
+        "operationId": "recordCheckoutConsent",
+        "summary": "Record an agreement or a refusal as evidence",
+        "description": "Four facts, because those are the four a lawyer asks for and a boolean answers none of them: **what** was agreed, **which version** of the text, **when**, and **from where**. `document_version` is the one people leave out and the one that matters most — \"they accepted the terms\" is worthless if nobody can say which terms were on the screen.\n\nThe IP address and the user agent are taken from this request and written to the consent row. **They are not returned by any operation in this document and are not written to any log line.** They were collected because a regulator asks who agreed and from where; echoing them onto a surface reachable with a bearer token would turn a legal record into a disclosure. Reach them under an actor's authority, through the database or an admin panel.\n\nKeyed on `(type, document_version)`. Re-submitting the same form does not fabricate a second agreement; a text that changes mid-session produces a second row rather than overwriting the first.\n\n`agreed: false` is a first-class value. A shopper who declined marketing has said something, and a missing row cannot tell that apart from a form that never rendered.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The session, with the consent recorded.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/checkout/sessions/{token}/tenders": {
+      "post": {
+        "operationId": "recordCheckoutTender",
+        "summary": "Record what a payment provider reported",
+        "description": "You call your provider; you record here what it said. There is no gateway in this package, no SDK, no provider interface and no provider name anywhere in its source. `provider` is an opaque string you choose and nothing here interprets.\n\n**A gift card is one of these and so is store credit** — they arrive as a `kind`, an amount and a `reference`, the same three facts a card authorisation arrives with. This module maintains no balance and cannot tell you what an instrument is worth: that ledger belongs to whoever issues and debits it, and a second reader of somebody else's balance is a second answer waiting to disagree.\n\nSeveral tenders per session are allowed. **Only `authorized` and `captured` count** towards the amount owed; `pending`, `failed` and `voided` are recorded and ignored by the arithmetic. The whole session comes back so you can see what is still outstanding without a second request.\n\n**Not idempotent, deliberately.** A duplicate tender is caught where it matters — at placement, by the exact-sum rule, which refuses an over-tender as loudly as an under-tender because a refund is not something this module can issue. A second idempotency contract here would be a second thing to get wrong.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenderRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The session, with the tender recorded.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/checkout/sessions/{token}/placement": {
+      "post": {
+        "operationId": "placeCheckout",
+        "summary": "Commit the checkout, exactly once",
+        "description": "The one operation in this document a retry must not duplicate, and the reason `Idempotency-Key` is **required** here.\n\nIt does not create an order. It decides that the session is open, unexpired, has lines, has somebody to tell, and that the `authorized` plus `captured` tenders sum **exactly** to the grand total — and then emits `CheckoutCompleted`, which is what an order module subscribes to.\n\n## The key\n\nCaller-supplied, at most 191 characters, scoped `('checkout.place', key)` by the domain. It identifies *this attempt to place this checkout*: mint one when you render the Place Order button, keep it across every retry, and **do not regenerate it on each click** — a key that changes per click protects nothing.\n\nIt is **not** optional and it is not minted server-side, because a server-minted key would be a new key on every retry, which is the same as no key at all. A request without one answers **400**: a fault in the request itself that no change to the body can fix.\n\n## The four outcomes\n\n| Situation | Status | `Idempotency-Replayed` |\n| --- | --- | --- |\n| New key | `200` | `false` — the commit happened here, and `CheckoutCompleted` was dispatched |\n| Same key, same payload | `200` | `true` — the stored result is replayed, no work runs, **no event is dispatched** |\n| Same key, different payload | `409` | — the key was spent on a different checkout |\n| Key claimed, work unfinished | `423` | — retry unchanged, after `Retry-After` |\n\n**Both successes are 200 on purpose.** A client must not have to branch on a status code to find out whether its order exists; the flag is in the `Idempotency-Replayed` header and in the `replayed` field of the body, and the `data` object is identical either way.\n\n**409 and 423 are different answers to different questions.** 409 is permanent: two genuinely different requests shared a key, and the only safe answers are \"conflict\" or \"commit twice\" — replaying the first result would be the third and worst, a success returned for something that never happened. 423 is transient: a first call has claimed the key and has not finished, so the honest answer is \"ask again in a moment\", and answering 409 there would tell a client to give up on a request that is at that instant succeeding. It is never an empty success.\n\n## A failed attempt does not burn the key\n\nThe claim is released when the work throws, so a placement refused by its guards — no email yet, tenders short of the total, session expired — leaves the key usable. Fix what was wrong and retry with **the same key**, which is what a client naturally does. That is why 422 here is not the end of a key's life.\n\nThe idempotency record is kept for `checkout.idempotency.retention_days` (30 by default). **That window must exceed the longest retry window any of your clients uses** — a key pruned while a client still holds it stops being idempotent, and the next retry places a second order.",
+        "tags": [
+          "shopper"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "shopper",
+        "x-liberu-anonymous": true,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:shopper.write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The placed checkout. `replayed` says whether this call did the work or replayed an earlier one; `data` is identical either way.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayed"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlacementEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "423": {
+            "$ref": "#/components/responses/Locked"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/staff/checkout/sessions": {
+      "get": {
+        "operationId": "listStaffCheckoutSessions",
+        "summary": "List the open checkout sessions in the actor's team",
+        "description": "The operator's view, behind the domain's `CheckoutSessionPolicy`. The team comes off the actor and is never a parameter; `store_id` narrows within it and cannot widen past it. An actor in no team is refused everything.\n\n**Open sessions only.** The domain publishes `open()`, `stale()` and `expired()` and no general listing, and this package does not write its own — a second answer to what a staff member may see is a bug waiting to happen. A placed or abandoned session is reached by its token at `GET /staff/checkout/sessions/{token}`.\n\nLines, tenders and consents are loaded, so a listing does not claim its sessions have none. Consent evidence — IP address and user agent — is not included here or anywhere else in this document.\n\n**A session filed under no team is visible to nobody**, because the policy matches on `team_id`. A deployment that wants this surface has to give this API a team to file into.",
+        "tags": [
+          "staff"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "staff",
+        "x-liberu-anonymous": false,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:staff.read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/storeFilter"
+          },
+          {
+            "$ref": "#/components/parameters/page"
+          },
+          {
+            "$ref": "#/components/parameters/perPage"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of open sessions.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedSessions"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/staff/checkout/sessions/{token}": {
+      "get": {
+        "operationId": "getStaffCheckoutSession",
+        "summary": "Read one checkout session as staff, in whatever state",
+        "description": "The same shape the shopper surface returns, reached with an actor instead of a token as credential — and still governed entirely by `CheckoutSessionPolicy`. A session belonging to another team answers 403.\n\n**404 before 403.** An unknown token is not a session this actor is being refused, it is not a session at all, and a 403 would confirm to anybody holding a staff token that a guessed string is somebody's live checkout.\n\nThere is no staff write of any kind in this document, and that is a decision rather than a gap: the policy denies `create` and `delete` outright, and every write worth having on a checkout is on the shopper's own surface with the shopper's own consent behind it. An operator editing a price snapshot somebody agreed to, over HTTP, is the thing this module copies its lines to prevent.",
+        "tags": [
+          "staff"
+        ],
+        "deprecated": false,
+        "x-liberu-deprecation": {
+          "since": null,
+          "sunset": null,
+          "successor": null
+        },
+        "x-liberu-route-group": "staff",
+        "x-liberu-anonymous": false,
+        "security": [
+          {
+            "checkoutToken": [
+              "checkout:staff.read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/token"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/XRateLimitLimit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/XRateLimitRemaining"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "checkoutToken": {
+        "type": "oauth2",
+        "description": "Scopes are enforced against whatever the actor answers to `tokenCan()` — Sanctum's abilities, Passport's scopes, or your own. **An actor with no such method carries no scope list to check** and is governed by the policy alone; that is a deliberate limit rather than a gap, because inventing a scope list for an actor that has none would mean denying every session-authenticated caller or admitting every one, and both are lies about what was checked.\n\nThe shopper group usually has no actor at all, and then there is nothing to narrow: what the request may reach is decided by possession of a token that names one checkout.\n\nThe audience is what is scoped, not the resource — driving one shopper's checkout and listing every open session in a team are categorically different grants.",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "https://your-host/oauth/token",
+            "scopes": {
+              "checkout:shopper.read": "Read a checkout session the caller holds the token for.",
+              "checkout:shopper.write": "Drive a checkout session: contact, discount, consent, tender, placement, abandonment.",
+              "checkout:staff.read": "Read checkout sessions in the actor's own team."
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "token": {
+        "name": "token",
+        "in": "path",
+        "required": true,
+        "description": "The session's opaque token. A bearer credential — 48 alphanumeric characters, and the only handle a guest has on their own checkout.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{20,64}$"
+        }
+      },
+      "idempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Names *this attempt to place this checkout*. Mint one when you render the Place Order button and keep it across every retry; a key regenerated per click protects nothing. Required — a server-minted key would be a new key on every retry, which is the same as no key at all.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 191
+        }
+      },
+      "storeFilter": {
+        "name": "store_id",
+        "in": "query",
+        "required": false,
+        "description": "Narrows within the actor's team. It cannot widen past it.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "page": {
+        "name": "page",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
+      },
+      "perPage": {
+        "name": "per_page",
+        "in": "query",
+        "required": false,
+        "description": "Bounded by `checkout-api.pagination.max_per_page`, because each session eager loads three relations.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 25
+        }
+      }
+    },
+    "headers": {
+      "XRequestId": {
+        "description": "The caller's `X-Request-Id` when they sent one, or a minted uuid. Quote it when reporting a failure.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "XRateLimitLimit": {
+        "description": "Requests permitted per minute.",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "XRateLimitRemaining": {
+        "description": "Requests left in the window.",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "IdempotencyReplayed": {
+        "description": "`true` when this response replays an earlier commit made under the same key — in which case no work ran and no event was dispatched. `false` when the commit happened on this call.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        }
+      }
+    },
+    "schemas": {
+      "Money": {
+        "type": "object",
+        "description": "An amount of money. `minor` is the authority — integer minor units, no float anywhere in this fleet — and `exponent` travels with it because a consumer handed `1999` cannot render it without knowing where the point goes. `decimal` is a **string**, because a JSON number is a float in most parsers and `19.99` does not exist as one.",
+        "required": [
+          "minor",
+          "currency",
+          "exponent",
+          "decimal"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "minor": {
+            "type": "integer",
+            "examples": [
+              1999
+            ]
+          },
+          "currency": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3,
+            "examples": [
+              "GBP"
+            ]
+          },
+          "exponent": {
+            "type": "integer",
+            "minimum": 0,
+            "examples": [
+              2
+            ]
+          },
+          "decimal": {
+            "type": "string",
+            "examples": [
+              "19.99"
+            ]
+          }
+        }
+      },
+      "Totals": {
+        "type": "object",
+        "description": "`net = subtotal - discount` and `grand_total = net + tax`, by construction on every session.",
+        "required": [
+          "subtotal",
+          "discount",
+          "net",
+          "tax",
+          "grand_total"
+        ],
+        "properties": {
+          "subtotal": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "discount": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "net": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "tax": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "grand_total": {
+            "$ref": "#/components/schemas/Money"
+          }
+        }
+      },
+      "Line": {
+        "type": "object",
+        "description": "One frozen line. `name`, `sku` and the prices are **copies** — a line must keep meaning something after the product it names has been renamed, re-priced or deleted — and `product_id` and `variant_id` are plain numbers with no relation behind them.",
+        "required": [
+          "kind",
+          "name",
+          "quantity",
+          "taxable",
+          "unit_price",
+          "subtotal",
+          "discount",
+          "net",
+          "tax",
+          "gross"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "item",
+              "shipping",
+              "fee"
+            ],
+            "description": "Shipping is a line rather than a column, so the discount rule, the tax rule and the rounding have exactly one implementation."
+          },
+          "name": {
+            "type": "string"
+          },
+          "sku": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quantity": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "product_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "variant_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "taxable": {
+            "type": "boolean"
+          },
+          "tax_rate_bp": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Basis points. Null when the tax arrived as an amount, which is what makes a later discount unreallocatable."
+          },
+          "position": {
+            "type": "integer"
+          },
+          "unit_price": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "subtotal": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "discount": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "net": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "tax": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "gross": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          }
+        }
+      },
+      "Tender": {
+        "type": "object",
+        "description": "Provider-neutral. `provider` is an opaque string the host chose and this API never interprets.",
+        "required": [
+          "kind",
+          "status",
+          "amount"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "payment",
+              "gift_card",
+              "store_credit"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "authorized",
+              "captured",
+              "failed",
+              "voided"
+            ],
+            "description": "Only `authorized` and `captured` count towards the amount owed."
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Money"
+          }
+        }
+      },
+      "Consent": {
+        "type": "object",
+        "description": "Evidence, redacted for the wire. The IP address and the user agent captured with the agreement are **deliberately absent** from every response in this document.",
+        "required": [
+          "type",
+          "document_version",
+          "agreed",
+          "agreed_at"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "examples": [
+              "terms"
+            ]
+          },
+          "document_version": {
+            "type": "string",
+            "examples": [
+              "2026-01-14"
+            ]
+          },
+          "document_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agreed": {
+            "type": "boolean",
+            "description": "False is a first-class value: a shopper who declined has said something."
+          },
+          "agreed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "description": "A checkout in progress. No row id is published — the token is the handle.",
+        "required": [
+          "token",
+          "status",
+          "currency",
+          "exponent",
+          "totals",
+          "lines",
+          "tenders",
+          "consents"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "48 unguessable characters. A bearer credential: keep it out of referrers and third-party analytics."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "placed",
+              "abandoned",
+              "expired"
+            ],
+            "description": "Every ending is terminal. A placed session must not reopen, because an order downstream already cites the snapshot it was built from."
+          },
+          "currency": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3
+          },
+          "exponent": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "email"
+          },
+          "customer_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "shipping_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "billing_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "totals": {
+            "$ref": "#/components/schemas/Totals"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Line"
+            }
+          },
+          "tenders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tender"
+            }
+          },
+          "consents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Consent"
+            }
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the price snapshot stops being honoured. Null means never, which is a decision and not a default."
+          },
+          "placed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "PlacedCheckout": {
+        "type": "object",
+        "description": "The frozen record of a commit. A different shape from a session rather than a session with `status: placed`: there is no `expires_at` left to watch and no discount left to change, and the two fields it gains are the two a retry needs to recognise its own receipt.",
+        "required": [
+          "token",
+          "currency",
+          "exponent",
+          "totals",
+          "lines",
+          "tenders",
+          "consents",
+          "idempotency_key",
+          "placed_at"
+        ],
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3
+          },
+          "exponent": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "email"
+          },
+          "customer_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "shipping_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "billing_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "totals": {
+            "$ref": "#/components/schemas/Totals"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Line"
+            }
+          },
+          "tenders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tender"
+            }
+          },
+          "consents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Consent"
+            }
+          },
+          "idempotency_key": {
+            "type": "string",
+            "description": "The key this commit was made under. Also the correlation id an order listener should be idempotent on."
+          },
+          "placed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "LineInput": {
+        "type": "object",
+        "required": [
+          "name",
+          "unit_price_minor"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "Copied into the session. Not a reference to a product's current name."
+          },
+          "unit_price_minor": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Already resolved by whoever owns pricing. Convert a decimal string with string arithmetic — `(int) (19.99 * 100)` is 1998."
+          },
+          "quantity": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "item",
+              "shipping",
+              "fee"
+            ],
+            "default": "item"
+          },
+          "sku": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 255
+          },
+          "product_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "variant_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "taxable": {
+            "type": "boolean",
+            "default": true
+          },
+          "tax_rate_bp": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 100000,
+            "description": "Basis points, applied to the net after any discount. **Prefer this to `tax_minor`** — a rate survives a later discount and an amount does not."
+          },
+          "tax_minor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "An amount you computed. A one-way door: `PUT .../discount` then answers 422."
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "SessionEnvelope": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Session"
+          }
+        }
+      },
+      "PlacementEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "replayed"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PlacedCheckout"
+          },
+          "replayed": {
+            "type": "boolean",
+            "description": "True when this response replays an earlier commit made under the same key. The same fact as the `Idempotency-Replayed` header, in the body, because a client reading a stored response has the body and not the headers."
+          }
+        }
+      },
+      "PaginatedSessions": {
+        "type": "object",
+        "required": [
+          "data",
+          "total"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Session"
+            }
+          },
+          "current_page": {
+            "type": "integer"
+          },
+          "per_page": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "last_page": {
+            "type": "integer"
+          }
+        }
+      },
+      "StartSessionRequest": {
+        "type": "object",
+        "required": [
+          "currency",
+          "lines"
+        ],
+        "properties": {
+          "currency": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3,
+            "examples": [
+              "GBP"
+            ]
+          },
+          "exponent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4,
+            "default": 2
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "email",
+            "maxLength": 255
+          },
+          "discount_minor": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Already decided by whoever owns promotions. Allocated pro-rata across every line."
+          },
+          "expires_in_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "description": "How long this price snapshot is honoured. Falls back to `checkout.session.ttl_minutes`; null means never."
+          },
+          "shipping_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "billing_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "lines": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/LineInput"
+            }
+          }
+        }
+      },
+      "ContactRequest": {
+        "type": "object",
+        "description": "Every field is optional and a null leaves the stored value alone.",
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "email",
+            "maxLength": 255
+          },
+          "shipping_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "billing_address": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          }
+        }
+      },
+      "DiscountRequest": {
+        "type": "object",
+        "required": [
+          "discount_minor"
+        ],
+        "properties": {
+          "discount_minor": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ConsentRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "document_version"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "maxLength": 191,
+            "description": "A free string — the vocabulary is yours."
+          },
+          "document_version": {
+            "type": "string",
+            "maxLength": 191,
+            "description": "The one people leave out and the one that matters most."
+          },
+          "document_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 2048
+          },
+          "agreed": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "TenderRequest": {
+        "type": "object",
+        "required": [
+          "amount_minor"
+        ],
+        "properties": {
+          "amount_minor": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "payment",
+              "gift_card",
+              "store_credit"
+            ],
+            "default": "payment"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "authorized",
+              "captured",
+              "failed",
+              "voided"
+            ],
+            "default": "pending"
+          },
+          "currency": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 3,
+            "maxLength": 3,
+            "description": "Must match the session's. This module holds no exchange rate."
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 191
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 191
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          }
+        }
+      },
+      "AbandonRequest": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 255
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "errors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The request itself is unusable and no change to the body fixes it. On `POST .../placement` this is a missing, blank or over-long `Idempotency-Key`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "No actor. The staff group resolves its own actor and answers this whether or not the host configured a guard.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The policy said no, or the token is missing the scope the operation requires.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "No such session. Identical for a token that names nothing and a token that names somebody else's checkout.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "The resource is in a state that refuses the request, permanently: a session that is no longer open, or an idempotency key already spent on a different payload. Retrying this unchanged will always fail.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Locked": {
+        "description": "The idempotency key is claimed by a call that has not finished. Transient, and its own status rather than a 409 — a client told \"conflict\" for an in-flight commit stops retrying, and the response it was waiting for never arrives. Retry unchanged after `Retry-After`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "Well-formed, and the rules say no. Validation, or one of the domain's refusals: nothing to place, nobody to tell, tenders that do not sum to the total, a currency the session is not in, a discount larger than the subtotal, or a tax amount that cannot be reallocated. A placement refused here does **not** burn its idempotency key.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "The limiter refused. Carries `Retry-After`. Note that a placement retry is meant to be cheap and safe — a limit that refuses it is a limit that hides the receipt.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}
