@@ -1,0 +1,47 @@
+{
+    "name": "liberusoftware/ecommerce-checkout-api",
+    "description": "Optional HTTP API for the Ecommerce Checkout module: a token-addressed shopper surface whose placement endpoint carries the domain's idempotency contract onto the wire, and a staff read surface behind the domain's policy.",
+    "type": "liberu-module",
+    "license": "MIT",
+    "version": "0.1.0",
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/liberusoftware/module-ecommerce-checkout"
+        }
+    ],
+    "require": {
+        "php": "^8.5",
+        "laravel/framework": "^13.0",
+        "liberusoftware/ecommerce-checkout": "^0.1"
+    },
+    "require-dev": {
+        "liberusoftware/package-testbench": "^1.7",
+        "pestphp/pest": "^5.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Liberu\\Ecommerce\\Checkout\\Api\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Liberu\\Ecommerce\\Checkout\\Api\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "liberu": {
+            "name": "ecommerce-checkout-api"
+        }
+    },
+    "scripts": {
+        "test": "pest"
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
