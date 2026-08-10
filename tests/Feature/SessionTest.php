@@ -30,10 +30,12 @@ it('starts a session from lines handed in, with no cart anywhere', function () {
         ->and($response->json('data.currency'))->toBe('GBP')
         ->and($response->json('data.lines'))->toHaveCount(2)
         ->and($response->json('data.lines.1.kind'))->toBe('shipping')
-        // 1999 × 2 + 499 = 4497 net, 20% = 899 tax.
+        // Tax is per line, half up, and only then summed — 3998 at 20% is 800
+        // and 499 at 20% is 100 (99.8 rounded up), so 900 rather than the 899
+        // a single multiplication of the blended subtotal would give.
         ->and($response->json('data.totals.subtotal.minor'))->toBe(4497)
-        ->and($response->json('data.totals.tax.minor'))->toBe(899)
-        ->and($response->json('data.totals.grand_total.minor'))->toBe(5396);
+        ->and($response->json('data.totals.tax.minor'))->toBe(900)
+        ->and($response->json('data.totals.grand_total.minor'))->toBe(5397);
 
     Event::assertDispatched(CheckoutStarted::class);
 });
